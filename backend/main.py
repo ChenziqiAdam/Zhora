@@ -6,6 +6,11 @@ import json
 import time
 import asyncio
 from starlette.responses import RedirectResponse
+from pydantic import BaseModel
+from dotenv import set_key, load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Google imports
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -16,7 +21,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from database import init_db, get_db_connection
 
 # AI Services imports
-from ai_services import process_media_for_context
+from ai_services import process_media_for_context, get_embedding, analyze_content_with_gpt4o
 
 app = FastAPI()
 
@@ -32,6 +37,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Pydantic Models
+class OpenAISettings(BaseModel):
+    api_key: str
+
+class AskQuery(BaseModel):
+    query: str
 
 # OAuth 2.0 scopes for Gmail and Google Drive
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 
@@ -74,10 +86,16 @@ async def process_file_in_background(filename: str):
     # Store Layer 3 embedding in the database
     conn = get_db_connection()
     cursor = conn.cursor()
-    # Ensure embedding is a JSON string to be stored as BLOB
-    embedding_json = json.dumps(ai_result.get("embedding", []))
+    embedding = ai_result.get("embedding", [])
+    embedding_json = json.dumps(embedding)
+    
     cursor.execute("INSERT INTO documents (filename, content, embedding) VALUES (?, ?, ?)", 
                    (filename, json.dumps(context_data), embedding_json))
+    last_row_id = cursor.lastrowid
+    
+    # Insert into the virtual table for vector search
+    cursor.execute("INSERT INTO documents_vec (rowid, embedding) VALUES (?, ?)", (last_row_id, embedding))
+    
     conn.commit()
     conn.close()
     print(f"Stored embedding in database (Layer 3) for {filename}")
@@ -112,6 +130,71 @@ async def create_upload_file(background_tasks: BackgroundTasks, file: UploadFile
     background_tasks.add_task(process_file_in_background, file.filename)
     
     return {"filename": file.filename, "message": "File uploaded successfully, processing in background."}
+
+@app.post("/settings/openai_key")
+async def save_openai_key(settings: OpenAISettings):
+    # Save the API key to a .env file in the backend directory
+    set_key(".env", "OPENAI_API_KEY", settings.api_key)
+    return {"message": "OpenAI API key saved successfully."}
+
+@app.post("/ask")
+async def ask_zhora(query: AskQuery):
+    # 1. Get embedding for the user's query
+    query_embedding = await get_embedding(query.query)
+
+    # 2. Perform semantic search in the database
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Perform a vector search on the documents_vec table
+    # This will return the rowids of the top 5 most similar documents
+    cursor.execute(
+        "SELECT rowid FROM documents_vec WHERE embedding MATCH ? ORDER BY distance LIMIT 5",
+        (json.dumps(query_embedding),)
+    )
+    retrieved_ids = cursor.fetchall()
+    
+    if not retrieved_ids:
+        conn.close()
+        return {"answer": "I couldn't find any relevant information in the project memory."}
+
+    # Retrieve the full document details for the found IDs
+    doc_ids = [row[0] for row in retrieved_ids]
+    cursor.execute(f"SELECT id, filename, content FROM documents WHERE id IN ({','.join('?'*len(doc_ids))})", doc_ids)
+    retrieved_docs = cursor.fetchall()
+    conn.close()
+
+    if not retrieved_docs:
+        return {"answer": "I couldn't find any relevant information in the project memory."}
+
+    # 3. Synthesize an answer with GPT-4o
+    context_for_gpt = "Based on the following project data:\n\n"
+    for doc in retrieved_docs:
+        doc_content = json.loads(doc[2])
+        context_for_gpt += f"- Document: {doc[1]}\n  Content: {doc_content.get('context', '')}\n\n"
+    
+    # Use the actual GPT-4o function from ai_services
+    final_answer = await analyze_content_with_gpt4o(f"Answer the following question: '{query.query}' based on this context:\n{context_for_gpt}")
+
+    return {"answer": final_answer, "sources": [doc[1] for doc in retrieved_docs]}
+
+@app.get("/documents")
+async def get_documents():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, filename, content FROM documents")
+    documents = cursor.fetchall()
+    conn.close()
+    
+    # Format the documents as a list of dictionaries
+    formatted_docs = []
+    for doc in documents:
+        formatted_docs.append({
+            "id": doc[0],
+            "filename": doc[1],
+            "content": json.loads(doc[2])
+        })
+    return formatted_docs
 
 @app.get("/auth/google")
 async def google_auth():

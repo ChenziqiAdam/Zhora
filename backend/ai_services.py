@@ -10,13 +10,15 @@ import time # Added import
 # For a real application, retrieve this securely (e.g., environment variables)
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+EMBEDDING_DIMENSION = 1536
+
 async def get_embedding(text: str) -> list[float]:
     """
     Generates an embedding for the given text using OpenAI's embedding model.
     """
     if not openai.api_key:
         print("Warning: OPENAI_API_KEY not set. Returning dummy embedding.")
-        return [0.0] * 1536  # Dummy embedding for testing
+        return [0.0] * EMBEDDING_DIMENSION  # Dummy embedding for testing
 
     try:
         response = await openai.Embedding.acreate(
@@ -26,7 +28,7 @@ async def get_embedding(text: str) -> list[float]:
         return response['data'][0]['embedding']
     except Exception as e:
         print(f"Error getting embedding from OpenAI: {e}")
-        return [0.0] * 1536 # Fallback to dummy embedding on error
+        return [0.0] * EMBEDDING_DIMENSION # Fallback to dummy embedding on error
 
 async def analyze_content_with_gpt4o(content: str) -> str:
     """
