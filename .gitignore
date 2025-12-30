@@ -1,0 +1,9 @@
+__pycache__
+.next
+node_modules
+.DS_Store
+
+backend/storage
+
+.GEMINI.md
+.PLAN.md
